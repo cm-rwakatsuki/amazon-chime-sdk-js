@@ -55,6 +55,7 @@
     "eslint": "^7.9.0",
     "eslint-config-prettier": "^4.3.0",
     "eslint-plugin-prettier": "^3.1.0",
+    "eslint-plugin-react": "^7.21.5",
     "eslint-plugin-simple-import-sort": "^4.0.0",
     "esm": "^3.2.25",
     "fs-extra": "^8.1.0",

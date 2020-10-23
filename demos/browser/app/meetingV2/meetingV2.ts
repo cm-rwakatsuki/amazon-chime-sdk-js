@@ -1,74 +1,28 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import './styleV2.scss';
-import 'bootstrap';
-
 import {
   AsyncScheduler,
   AudioVideoFacade,
   AudioVideoObserver,
-  ClientMetricReport,
-  ConsoleLogger,
-  ContentShareObserver,
-  DataMessage,
   DefaultActiveSpeakerPolicy,
   DefaultAudioMixController,
+  DefaultBrowserBehavior,
   DefaultDeviceController,
   DefaultMeetingSession,
   DefaultModality,
   Device,
-  DefaultBrowserBehavior,
-  DeviceChangeObserver,
-  LogLevel,
   Logger,
-  MultiLogger,
+  LogLevel,
   MeetingSession,
   MeetingSessionConfiguration,
   MeetingSessionPOSTLogger,
   MeetingSessionStatus,
   MeetingSessionStatusCode,
-  MeetingSessionVideoAvailability,
-  TimeoutScheduler,
-  Versioning,
-  VideoTileState,
-  ClientVideoStreamReceivingReport,
+  PingPongObserver,
+  TimeoutScheduler
 } from '../../../../src/index';
-
-class DemoTileOrganizer {
-  // this is index instead of length
-  static MAX_TILES = 17;
-  public tiles: { [id: number]: number } = {};
-  public tileStates: {[id: number]: boolean } = {};
-  public remoteTileCount = 0;
-
-  acquireTileIndex(tileId: number): number {
-    for (let index = 0; index <= DemoTileOrganizer.MAX_TILES; index++) {
-      if (this.tiles[index] === tileId) {
-        return index;
-      }
-    }
-    for (let index = 0; index <= DemoTileOrganizer.MAX_TILES; index++) {
-      if (!(index in this.tiles)) {
-        this.tiles[index] = tileId;
-        this.remoteTileCount++;
-        return index;
-      }
-    }
-    throw new Error('no tiles are available');
-  }
-
-  releaseTileIndex(tileId: number): number {
-    for (let index = 0; index <= DemoTileOrganizer.MAX_TILES; index++) {
-      if (this.tiles[index] === tileId) {
-        this.remoteTileCount--;
-        delete this.tiles[index];
-        return index;
-      }
-    }
-    return DemoTileOrganizer.MAX_TILES;
-  }
-}
+import ClientMetricReport from "../../../../src/clientmetricreport/ClientMetricReport";
 
 class TestSound {
   constructor(
@@ -96,21 +50,20 @@ class TestSound {
     oscillatorNode.start();
     const audioMixController = new DefaultAudioMixController();
     // @ts-ignore
-    audioMixController.bindAudioDevice({ deviceId: sinkId });
+    audioMixController.bindAudioDevice({deviceId: sinkId});
     audioMixController.bindAudioElement(new Audio());
     audioMixController.bindAudioStream(destinationStream.stream);
     new TimeoutScheduler((rampSec * 2 + durationSec + 1) * 1000).start(() => {
       audioContext.close();
     });
+    audioContext.resume().then(() => {
+      console.log('Playback resumed successfully');
+    });
   }
 }
 
-export enum ContentShareType {
-  ScreenCapture,
-  VideoFile,
-};
 
-export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver, ContentShareObserver {
+export class DemoMeetingApp implements AudioVideoObserver, PingPongObserver {
   static readonly DID: string = '+17035550122';
   static readonly BASE_URL: string = [location.protocol, '//', location.host, location.pathname.replace(/\/*$/, '/').replace('/v2', '')].join('');
   static testVideo: string = 'https://upload.wikimedia.org/wikipedia/commons/transcoded/c/c0/Big_Buck_Bunny_4K.webm/Big_Buck_Bunny_4K.webm.360p.vp9.webm';
@@ -128,46 +81,32 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
   region: string | null = null;
   meetingSession: MeetingSession | null = null;
   audioVideo: AudioVideoFacade | null = null;
-  tileOrganizer: DemoTileOrganizer = new DemoTileOrganizer();
   canStartLocalVideo: boolean = true;
   defaultBrowserBehaviour: DefaultBrowserBehavior;
   // eslint-disable-next-line
   roster: any = {};
-  tileIndexToTileId: { [id: number]: number } = {};
-  tileIdToTileIndex: { [id: number]: number } = {};
-  tileArea = document.getElementById('tile-area') as HTMLDivElement;
-
+  metricReport: any = {};
+  sessionMeetingId: string = '';
+  sessionAttendeeId: string = '';
   cameraDeviceIds: string[] = [];
   microphoneDeviceIds: string[] = [];
-
-  buttonStates: { [key: string]: boolean } = {
-    'button-microphone': true,
-    'button-camera': false,
-    'button-speaker': true,
-    'button-content-share': false,
-    'button-pause-content-share': false,
-  };
-
-  contentShareType: ContentShareType = ContentShareType.ScreenCapture;
+  logger: Logger = null;
+  buttonStates: { [key: string]: boolean } = {};
+  instanceId: string | null = null;
+  loadTestStartTime: string | null = null;
+  loadTestSessionName: string | null = null;
 
   // feature flags
   enableWebAudio = false;
-  enableUnifiedPlanForChromiumBasedBrowsers = true;
+  enableUnifiedPlanForChromiumBasedBrowsers = false;
   enableSimulcast = false;
-
-  markdown = require('markdown-it')({linkify: true});
-  lastMessageSender: string | null = null;
-  lastReceivedMessageTimestamp = 0;
+  private meetingActive: boolean = false;
 
   constructor() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (global as any).app = this;
-    (document.getElementById('sdk-version') as HTMLSpanElement).innerText =
-      "amazon-chime-sdk-js@" + Versioning.sdkVersion;
     this.initEventListeners();
     this.initParameters();
-    this.setMediaRegion();
-    this.setUpVideoTileElementResizer();
     if (this.isRecorder() || this.isBroadcaster()) {
       new AsyncScheduler().start(async () => {
         this.meeting = new URL(window.location.href).searchParams.get('m');
@@ -180,6 +119,33 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     } else {
       this.switchToFlow('flow-authenticate');
     }
+
+    const queryString = window.location.search;
+    const urlParams = new URLSearchParams(queryString);
+    const meetingInfo = JSON.parse(urlParams.get('meetingInfo'));
+    const attendeeInfo = JSON.parse(urlParams.get('attendeeInfo'));
+    this.sessionMeetingId = meetingInfo.MeetingId;
+    this.sessionAttendeeId = attendeeInfo.AttendeeId;
+    (document.getElementById('inputMeeting') as HTMLInputElement).value = this.sessionMeetingId;
+    (document.getElementById('inputName') as HTMLInputElement).value = this.sessionAttendeeId;
+
+    this.instanceId = new URL(window.location.href).searchParams.get('instanceId');
+    this.loadTestStartTime = new URL(window.location.href).searchParams.get('loadTestStartTime');
+    this.loadTestSessionName = new URL(window.location.href).searchParams.get('loadTestSessionName');
+
+    const timeToWaitMS = new URL(window.location.href).searchParams.get('timeToWaitMS');
+    const timeToWait = parseInt(timeToWaitMS, 10);
+    const meetingLeaveAfterMs = new URL(window.location.href).searchParams.get('meetingLeaveAfterMs');
+    const meetingLeaveAfter = parseInt(meetingLeaveAfterMs, 10);
+    setTimeout(() => {
+      document.getElementById('authenticate').click();
+      this.sendStatus('MeetingJoin', 1);
+      document.getElementById('authenticate').click();
+    }, timeToWait);
+
+    setTimeout(() => {
+      document.getElementById('button-meeting-leave').click();
+    }, meetingLeaveAfter);
   }
 
   initParameters(): void {
@@ -198,7 +164,7 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
       e.preventDefault();
       this.meeting = (document.getElementById('inputMeeting') as HTMLInputElement).value;
       this.name = (document.getElementById('inputName') as HTMLInputElement).value;
-      this.region = (document.getElementById('inputRegion') as HTMLInputElement).value;
+      this.region = 'us-east-1';
       new AsyncScheduler().start(
         async (): Promise<void> => {
           let chimeMeetingId: string = '';
@@ -206,13 +172,13 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
           try {
             chimeMeetingId = await this.authenticate();
           } catch (error) {
-            console.error(error);
-            const httpErrorMessage = 'UserMedia is not allowed in HTTP sites. Either use HTTPS or enable media capture on insecure sites.';
+            this.log(error);
+            this.log(error.message);
             (document.getElementById(
               'failed-meeting'
             ) as HTMLDivElement).innerText = `Meeting ID: ${this.meeting}`;
             (document.getElementById('failed-meeting-error') as HTMLDivElement).innerText =
-              window.location.protocol === 'http:' ? httpErrorMessage : error.message;
+              error.message;
             this.switchToFlow('flow-failed-meeting');
             return;
           }
@@ -223,138 +189,27 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
             'chime-meeting-id'
           ) as HTMLSpanElement).innerText = `Meeting ID: ${chimeMeetingId}`;
           (document.getElementById(
-            'mobile-chime-meeting-id'
-          ) as HTMLSpanElement).innerText = `Meeting ID: ${chimeMeetingId}`;
-          (document.getElementById(
-            'mobile-attendee-id'
-          ) as HTMLSpanElement).innerText = `Attendee ID: ${this.meetingSession.configuration.credentials.attendeeId}`;
-          (document.getElementById(
             'desktop-attendee-id'
           ) as HTMLSpanElement).innerText = `Attendee ID: ${this.meetingSession.configuration.credentials.attendeeId}`;
           (document.getElementById('info-meeting') as HTMLSpanElement).innerText = this.meeting;
           (document.getElementById('info-name') as HTMLSpanElement).innerText = this.name;
-          this.switchToFlow('flow-devices');
+          await new Promise(resolve => setTimeout(resolve, 2500));
+          await this.join();
+          await this.audioVideo.chooseVideoInputDevice(null);
+          await this.audioVideo.chooseAudioInputDevice(this.audioInputSelectionToDevice('440 Hz'));
+          this.displayButtonStates();
+          this.switchToFlow('flow-meeting');
           await this.openAudioInputFromSelection();
-          try {
-            await this.openVideoInputFromSelection(
-              (document.getElementById('video-input') as HTMLSelectElement).value,
-              true
-            );
-          } catch (err) {
-            this.log('no video input device selected');
-          }
           await this.openAudioOutputFromSelection();
           this.hideProgress('progress-authenticate');
         }
       );
     });
 
-    document.getElementById('to-sip-flow').addEventListener('click', e => {
-      e.preventDefault();
-      this.switchToFlow('flow-sip-authenticate');
-    });
-
-    document.getElementById('form-sip-authenticate').addEventListener('submit', e => {
-      e.preventDefault();
-      this.meeting = (document.getElementById('sip-inputMeeting') as HTMLInputElement).value;
-      this.voiceConnectorId = (document.getElementById(
-        'voiceConnectorId'
-      ) as HTMLInputElement).value;
-
-      new AsyncScheduler().start(
-        async (): Promise<void> => {
-          this.showProgress('progress-authenticate');
-          const region = this.region || 'us-east-1';
-          try {
-            const response = await fetch(
-              `${DemoMeetingApp.BASE_URL}join?title=${encodeURIComponent(this.meeting)}&name=${encodeURIComponent(DemoMeetingApp.DID)}&region=${encodeURIComponent(region)}`,
-              {
-                method: 'POST',
-              }
-            );
-            const json = await response.json();
-            const joinToken = json.JoinInfo.Attendee.Attendee.JoinToken;
-            this.sipURI = `sip:${DemoMeetingApp.DID}@${this.voiceConnectorId};transport=tls;X-joinToken=${joinToken}`;
-            this.switchToFlow('flow-sip-uri');
-          } catch (error) {
-            (document.getElementById(
-              'failed-meeting'
-            ) as HTMLDivElement).innerText = `Meeting ID: ${this.meeting}`;
-            (document.getElementById('failed-meeting-error') as HTMLDivElement).innerText =
-              error.message;
-            this.switchToFlow('flow-failed-meeting');
-            return;
-          }
-          const sipUriElement = document.getElementById('sip-uri') as HTMLInputElement;
-          sipUriElement.value = this.sipURI;
-          this.hideProgress('progress-authenticate');
-        }
-      );
-    });
-
-    document.getElementById('copy-sip-uri').addEventListener('click', () => {
-      const sipUriElement = document.getElementById('sip-uri') as HTMLInputElement;
-      sipUriElement.select();
-      document.execCommand('copy');
-    });
-
     const audioInput = document.getElementById('audio-input') as HTMLSelectElement;
     audioInput.addEventListener('change', async (_ev: Event) => {
       this.log('audio input device is changed');
       await this.openAudioInputFromSelection();
-    });
-
-    const videoInput = document.getElementById('video-input') as HTMLSelectElement;
-    videoInput.addEventListener('change', async (_ev: Event) => {
-      this.log('video input device is changed');
-      try {
-        await this.openVideoInputFromSelection(videoInput.value, true);
-      } catch (err) {
-        this.log('no video input device selected');
-      }
-    });
-
-    const optionalFeatures = document.getElementById('optional-features') as HTMLSelectElement;
-    optionalFeatures.addEventListener('change', async (_ev: Event) => {
-      const collections = optionalFeatures.selectedOptions;
-      this.enableSimulcast = false;
-      this.enableWebAudio = false;
-      this.enableUnifiedPlanForChromiumBasedBrowsers = true;
-      this.log("Feature lists:");
-      for (let i = 0; i < collections.length; i++) {
-        // hard code magic
-        if (collections[i].value === 'simulcast') {
-          this.enableSimulcast = true;
-          this.log('attempt to enable simulcast');
-          const videoInputQuality = document.getElementById('video-input-quality') as HTMLSelectElement;
-          videoInputQuality.value = '720p';
-        }
-        if (collections[i].value === 'webaudio') {
-          this.enableWebAudio = true;
-          this.log('attempt to enable webaudio');
-        }
-      }
-    });
-
-    const videoInputQuality = document.getElementById('video-input-quality') as HTMLSelectElement;
-    videoInputQuality.addEventListener('change', async (_ev: Event) => {
-      this.log('Video input quality is changed');
-      switch (videoInputQuality.value) {
-        case '360p':
-          this.audioVideo.chooseVideoInputQuality(640, 360, 15, 600);
-          break;
-        case '540p':
-          this.audioVideo.chooseVideoInputQuality(960, 540, 15, 1400);
-          break;
-        case '720p':
-          this.audioVideo.chooseVideoInputQuality(1280, 720, 15, 1400);
-          break;
-      }
-      try {
-        await this.openVideoInputFromSelection(videoInput.value, true);
-      } catch (err) {
-        this.log('no video input device selected');
-      }
     });
 
     const audioOutput = document.getElementById('audio-output') as HTMLSelectElement;
@@ -369,126 +224,6 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
       new TestSound(audioOutput.value);
     });
 
-    document.getElementById('form-devices').addEventListener('submit', e => {
-      e.preventDefault();
-      new AsyncScheduler().start(async () => {
-        try {
-          this.showProgress('progress-join');
-          await this.join();
-          this.audioVideo.stopVideoPreviewForVideoInput(document.getElementById(
-            'video-preview'
-          ) as HTMLVideoElement);
-          this.audioVideo.chooseVideoInputDevice(null);
-          this.hideProgress('progress-join');
-          this.displayButtonStates();
-          this.switchToFlow('flow-meeting');
-        } catch (error) {
-          document.getElementById('failed-join').innerText = `Meeting ID: ${this.meeting}`;
-          document.getElementById('failed-join-error').innerText = `Error: ${error.message}`;
-        }
-      });
-    });
-
-    const buttonMute = document.getElementById('button-microphone');
-    buttonMute.addEventListener('mousedown', _e => {
-      if (this.toggleButton('button-microphone')) {
-        this.audioVideo.realtimeUnmuteLocalAudio();
-      } else {
-        this.audioVideo.realtimeMuteLocalAudio();
-      }
-    });
-
-    const buttonVideo = document.getElementById('button-camera');
-    buttonVideo.addEventListener('click', _e => {
-      new AsyncScheduler().start(async () => {
-        if (this.toggleButton('button-camera') && this.canStartLocalVideo) {
-          try {
-            let camera: string = videoInput.value;
-            if (videoInput.value === 'None') {
-              camera = this.cameraDeviceIds.length ? this.cameraDeviceIds[0] : 'None';
-            }
-            await this.openVideoInputFromSelection(camera, false);
-            this.audioVideo.startLocalVideoTile();
-          } catch (err) {
-            this.log('no video input device selected');
-          }
-        } else {
-          this.audioVideo.stopLocalVideoTile();
-          this.hideTile(DemoTileOrganizer.MAX_TILES);
-        }
-      });
-    });
-
-    const buttonPauseContentShare = document.getElementById('button-pause-content-share');
-    buttonPauseContentShare.addEventListener('click', _e => {
-      if (!this.isButtonOn('button-content-share')) {
-        return;
-      }
-      new AsyncScheduler().start(async () => {
-        if (this.toggleButton('button-pause-content-share')) {
-          this.audioVideo.pauseContentShare();
-        } else {
-          this.audioVideo.unpauseContentShare();
-        }
-      });
-    });
-
-    const buttonContentShare = document.getElementById('button-content-share');
-    buttonContentShare.addEventListener('click', _e => {
-      new AsyncScheduler().start(() => {
-        if (!this.isButtonOn('button-content-share')) {
-          this.contentShareStart();
-        } else {
-          this.contentShareStop();
-        }
-      });
-    });
-
-    const buttonSpeaker = document.getElementById('button-speaker');
-    buttonSpeaker.addEventListener('click', _e => {
-      new AsyncScheduler().start(async () => {
-        if (this.toggleButton('button-speaker')) {
-          this.audioVideo.bindAudioElement(document.getElementById(
-            'meeting-audio'
-          ) as HTMLAudioElement);
-        } else {
-          this.audioVideo.unbindAudioElement();
-        }
-      });
-    });
-
-    const sendMessage = () => {
-      new AsyncScheduler().start(() => {
-        const textArea = document.getElementById('send-message') as HTMLTextAreaElement;
-        const textToSend = textArea.value.trim();
-        if (!textToSend) {
-          return;
-        }
-        textArea.value = '';
-        this.audioVideo.realtimeSendDataMessage(DemoMeetingApp.DATA_MESSAGE_TOPIC, textToSend, DemoMeetingApp.DATA_MESSAGE_LIFETIME_MS);
-        // echo the message to the handler
-        this.dataMessageHandler(new DataMessage(
-          Date.now(),
-          DemoMeetingApp.DATA_MESSAGE_TOPIC,
-          new TextEncoder().encode(textToSend),
-          this.meetingSession.configuration.credentials.attendeeId,
-          this.meetingSession.configuration.credentials.externalUserId
-        ));
-      });
-    };
-
-    const textAreaSendMessage = document.getElementById('send-message') as HTMLTextAreaElement;
-    textAreaSendMessage.addEventListener('keydown', e => {
-      if (e.keyCode === 13) {
-        if (e.shiftKey) {
-          textAreaSendMessage.rows++;
-        } else {
-          e.preventDefault();
-          sendMessage();
-          textAreaSendMessage.rows = 1;
-        }
-      }
-    });
 
     const buttonMeetingEnd = document.getElementById('button-meeting-end');
     buttonMeetingEnd.addEventListener('click', _e => {
@@ -510,60 +245,64 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     const buttonMeetingLeave = document.getElementById('button-meeting-leave');
     buttonMeetingLeave.addEventListener('click', _e => {
       new AsyncScheduler().start(async () => {
+        const newRosterCount = Object.keys(this.roster).length;
+        if (newRosterCount === 1) {
+          await this.endMeeting();
+        }
         (buttonMeetingLeave as HTMLButtonElement).disabled = true;
+        this.sendStatus('MeetingLeave', 1);
+
         this.leave();
         (buttonMeetingLeave as HTMLButtonElement).disabled = false;
         // @ts-ignore
         window.location = window.location.pathname;
       });
     });
-  }
 
-  getSupportedMediaRegions(): Array<string> {
-    const supportedMediaRegions: Array<string> = [];
-    const mediaRegion = (document.getElementById("inputRegion")) as HTMLSelectElement;
-    for (var i = 0; i < mediaRegion.length; i++) {
-      supportedMediaRegions.push(mediaRegion.value);
-    }
-    return supportedMediaRegions;
-  }
+    setInterval(() => {
+      if (new Date().getMinutes() % 5 === 0 && this.meetingActive === true) {
+        this.log('Sending AlivePing when minutes is multiple of 5');
+        this.sendStatus('AlivePing', 1);
 
-  async getNearestMediaRegion(): Promise<string> {
-    const nearestMediaRegionResponse = await fetch(
-      `https://nearest-media-region.l.chime.aws`,
-      {
-        method: 'GET',
       }
-    );
-    const nearestMediaRegionJSON = await nearestMediaRegionResponse.json();
-    const nearestMediaRegion = nearestMediaRegionJSON.region;
-    return nearestMediaRegion;
+    }, 50000);
+
+    setInterval(() => {
+      if (Object.keys(this.metricReport).length > 0) { // && timeSinceStartOfLoadTest > 5500) {
+        console.log(this.metricReport);
+        this.sendMetrics(this.metricReport);
+      }
+    }, 1000);
   }
 
-  setMediaRegion(): void {
-    new AsyncScheduler().start(
-      async (): Promise<void> => {
-        try {
-          const nearestMediaRegion = await this.getNearestMediaRegion();
-          if (nearestMediaRegion === '' || nearestMediaRegion === null) {
-            throw new Error('Nearest Media Region cannot be null or empty');
-          }
-          const supportedMediaRegions: Array<string> = this.getSupportedMediaRegions();
-          if (supportedMediaRegions.indexOf(nearestMediaRegion) === -1 ) {
-            supportedMediaRegions.push(nearestMediaRegion);
-            const mediaRegionElement = (document.getElementById("inputRegion")) as HTMLSelectElement;
-            const newMediaRegionOption = document.createElement("option");
-            newMediaRegionOption.value = nearestMediaRegion;
-            newMediaRegionOption.text = nearestMediaRegion + " (" + nearestMediaRegion + ")";
-            mediaRegionElement.add(newMediaRegionOption, null);
-          }
-          (document.getElementById('inputRegion') as HTMLInputElement).value = nearestMediaRegion;
-        } catch (error) {
-          this.log('Default media region selected: ' + error.message);
-        }
+  async sendMetrics(metrics: any): Promise<void> {
+    metrics.mId = this.sessionMeetingId;
+    metrics.aId = this.sessionAttendeeId;
+    metrics.sId = this.loadTestSessionName;
+    metrics.iId = this.instanceId;
+    metrics.ltStartTime = new Date(parseInt(this.loadTestStartTime.toString()));
+    const body = JSON.stringify(metrics);
+    console.log(body);
+    try {
+      const response = await fetch(`${DemoMeetingApp.BASE_URL}send_metrics`, {
+        method: 'POST',
+        body
       });
+      if (response.status === 200) {
+        console.log('Metrics Sent');
+      }
+    } catch (error) {
+      console.error(error.message);
+    }
   }
 
+  async sendStatus(metricName: string, metricValue: number): Promise<void> {
+    const metricBody = {
+      metricName: metricName,
+      metricValue: metricValue
+    };
+      await this.sendMetrics(metricBody);
+  }
   toggleButton(button: string, state?: 'on' | 'off'): boolean {
     if (state === 'on') {
       this.buttonStates[button] = true;
@@ -607,23 +346,21 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
   }
 
   switchToFlow(flow: string): void {
-    this.analyserNodeCallback = () => {};
+    this.analyserNodeCallback = () => {
+    };
     Array.from(document.getElementsByClassName('flow')).map(
       e => ((e as HTMLDivElement).style.display = 'none')
     );
     (document.getElementById(flow) as HTMLDivElement).style.display = 'block';
+
   }
 
   audioInputsChanged(_freshAudioInputDeviceList: MediaDeviceInfo[]): void {
-    this.populateAudioInputList();
-  }
-
-  videoInputsChanged(_freshVideoInputDeviceList: MediaDeviceInfo[]): void {
-    this.populateVideoInputList();
+    //this.populateAudioInputList();
   }
 
   audioOutputsChanged(_freshAudioOutputDeviceList: MediaDeviceInfo[]): void {
-    this.populateAudioOutputList();
+    //this.populateAudioOutputList();
   }
 
   audioInputStreamEnded(deviceId: string): void {
@@ -634,37 +371,8 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     this.log(`Current video input stream from device id ${deviceId} ended.`);
   }
 
-  estimatedDownlinkBandwidthLessThanRequired(estimatedDownlinkBandwidthKbps: number, requiredVideoDownlinkBandwidthKbps: number ): void {
+  estimatedDownlinkBandwidthLessThanRequired(estimatedDownlinkBandwidthKbps: number, requiredVideoDownlinkBandwidthKbps: number): void {
     this.log(`Estimated downlink bandwidth is ${estimatedDownlinkBandwidthKbps} is less than required bandwidth for video ${requiredVideoDownlinkBandwidthKbps}`);
-  }
-
-  videoNotReceivingEnoughData(videoReceivingReports: ClientVideoStreamReceivingReport[]): void {
-    this.log(`One or more video streams are not receiving expected amounts of data ${JSON.stringify(videoReceivingReports)}`);
-  }
-
-  metricsDidReceive(clientMetricReport: ClientMetricReport): void {
-    const metricReport = clientMetricReport.getObservableMetrics();
-    if (typeof metricReport.availableSendBandwidth === 'number' && !isNaN(metricReport.availableSendBandwidth)) {
-      (document.getElementById('video-uplink-bandwidth') as HTMLSpanElement).innerText =
-        'Available Uplink Bandwidth: ' + String(metricReport.availableSendBandwidth / 1000) + ' Kbps';
-    } else if (typeof metricReport.availableOutgoingBitrate === 'number' && !isNaN(metricReport.availableOutgoingBitrate)) {
-      (document.getElementById('video-uplink-bandwidth') as HTMLSpanElement).innerText =
-        'Available Uplink Bandwidth: ' + String(metricReport.availableOutgoingBitrate / 1000) + ' Kbps';
-    } else {
-      (document.getElementById('video-uplink-bandwidth') as HTMLSpanElement).innerText =
-        'Available Uplink Bandwidth: Unknown';
-    }
-
-    if (typeof metricReport.availableReceiveBandwidth === 'number' && !isNaN(metricReport.availableReceiveBandwidth)) {
-      (document.getElementById('video-downlink-bandwidth') as HTMLSpanElement).innerText =
-        'Available Downlink Bandwidth: ' + String(metricReport.availableReceiveBandwidth / 1000) + ' Kbps';
-    } else if (typeof metricReport.availableIncomingBitrate === 'number' && !isNaN(metricReport.availableIncomingBitrate)) {
-      (document.getElementById('video-downlink-bandwidth') as HTMLSpanElement).innerText =
-        'Available Downlink Bandwidth: ' + String(metricReport.availableIncomingBitrate / 1000) + ' Kbps';
-    } else {
-      (document.getElementById('video-downlink-bandwidth') as HTMLSpanElement).innerText =
-        'Available Downlink Bandwidth: Unknown';
-    }
   }
 
   async createLogStream(configuration: MeetingSessionConfiguration): Promise<void> {
@@ -685,50 +393,101 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     }
   }
 
+  async getLoadTestStatus() {
+    setInterval(async () => {
+      try {
+        const url = DemoMeetingApp.BASE_URL + 'get_load_test_status';
+        console.error('11111 ', url);
+        const response = await fetch(url, {method: 'GET'});
+        console.error('010101 ', response);
+        console.error('3333 ', response.body);
+        console.error('4444 ',response.body.toString());
+        if (response.status === 200) {
+          const loadTestStatusResponse = await response.json();
+          console.error('5555 ',loadTestStatusResponse);
+          console.error('6666 ',loadTestStatusResponse.LoadTestStatus);
+          console.error('7777 ',loadTestStatusResponse.LoadTestStatus === 'Abort');
+          if (loadTestStatusResponse.LoadTestStatus === 'Abort') {
+            const buttonMeetingEnd = document.getElementById('button-meeting-end');
+            buttonMeetingEnd.click();
+          }
+        }
+      } catch (error) {
+        console.warn('[getLoadTestStatus] ' + error.message);
+      }
+    }, 2000);
+  }
+
   async initializeMeetingSession(configuration: MeetingSessionConfiguration): Promise<void> {
-    let logger: Logger;
+    await this.getLoadTestStatus();
     const logLevel = LogLevel.INFO;
-    const consoleLogger = logger = new ConsoleLogger('SDK', logLevel);
-    if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-      logger = consoleLogger;
-    } else {
-      await this.createLogStream(configuration);
-      logger = new MultiLogger(
-        consoleLogger,
-        new MeetingSessionPOSTLogger(
-          'SDK',
-          configuration,
-          DemoMeetingApp.LOGGER_BATCH_SIZE,
-          DemoMeetingApp.LOGGER_INTERVAL_MS,
-          `${DemoMeetingApp.BASE_URL}logs`,
-          logLevel
-        ),
-      );
-    }
-    const deviceController = new DefaultDeviceController(logger);
+    await this.createLogStream(configuration);
+    this.logger = new MeetingSessionPOSTLogger(
+      'SDK',
+      configuration,
+      DemoMeetingApp.LOGGER_BATCH_SIZE,
+      DemoMeetingApp.LOGGER_INTERVAL_MS,
+      `${DemoMeetingApp.BASE_URL}logs`,
+      logLevel
+    );
+    const deviceController = new DefaultDeviceController(this.logger);
     configuration.enableWebAudio = this.enableWebAudio;
     configuration.enableUnifiedPlanForChromiumBasedBrowsers = this.enableUnifiedPlanForChromiumBasedBrowsers;
     configuration.attendeePresenceTimeoutMs = 5000;
     configuration.enableSimulcastForUnifiedPlanChromiumBasedBrowsers = this.enableSimulcast;
-    this.meetingSession = new DefaultMeetingSession(configuration, logger, deviceController);
+    this.meetingSession = new DefaultMeetingSession(configuration, this.logger, deviceController);
     this.audioVideo = this.meetingSession.audioVideo;
 
     this.audioVideo.addDeviceChangeObserver(this);
-    this.setupDeviceLabelTrigger();
     await this.populateAllDeviceLists();
     this.setupMuteHandler();
     this.setupCanUnmuteHandler();
     this.setupSubscribeToAttendeeIdPresenceHandler();
-    this.setupDataMessage();
     this.audioVideo.addObserver(this);
-    this.audioVideo.addContentShareObserver(this);
-    this.initContentShareDropDownItems();
   }
 
   setClickHandler(elementId: string, f: () => void): void {
     document.getElementById(elementId).addEventListener('click', () => {
       f();
     });
+  }
+
+  async metricsDidReceive(clientMetricReport: ClientMetricReport): Promise<void> {
+    const metricReport = clientMetricReport.getObservableMetrics();
+    if (typeof metricReport.audioDecoderLoss === 'number' && !isNaN(metricReport.audioDecoderLoss)) {
+      (document.getElementById('audioDecoderLoss') as HTMLSpanElement).innerText = String(metricReport.audioDecoderLoss);
+    }
+    if (typeof metricReport.audioPacketsReceived === 'number' && !isNaN(metricReport.audioPacketsReceived)) {
+      (document.getElementById('audioPacketsReceived') as HTMLSpanElement).innerText = String(metricReport.audioPacketsReceived);
+    }
+    if (typeof metricReport.audioPacketsReceivedFractionLoss === 'number' && !isNaN(metricReport.audioPacketsReceivedFractionLoss)) {
+      (document.getElementById('audioPacketsReceivedFractionLoss') as HTMLSpanElement).innerText = String(metricReport.audioPacketsReceivedFractionLoss);
+    }
+    if (typeof metricReport.audioSpeakerDelayMs === 'number' && !isNaN(metricReport.audioSpeakerDelayMs)) {
+      (document.getElementById('audioSpeakerDelayMs') as HTMLSpanElement).innerText = String(metricReport.audioSpeakerDelayMs);
+    }
+    if (typeof metricReport.availableReceiveBandwidth === 'number' && !isNaN(metricReport.availableReceiveBandwidth)) {
+      (document.getElementById('availableReceiveBandwidth') as HTMLSpanElement).innerText = String(metricReport.availableReceiveBandwidth);
+    }
+    if (typeof metricReport.availableSendBandwidth === 'number' && !isNaN(metricReport.availableSendBandwidth)) {
+      (document.getElementById('availableSendBandwidth') as HTMLSpanElement).innerText = String(metricReport.availableSendBandwidth);
+    }
+
+    if (typeof metricReport.audioPacketsReceived === 'number') {
+      delete metricReport.availableOutgoingBitrate;
+      delete metricReport.availableIncomingBitrate;
+      delete metricReport.nackCountReceivedPerSecond;
+      delete metricReport.googNackCountReceivedPerSecond;
+      delete metricReport.videoUpstreamBitrate;
+      delete metricReport.videoPacketSentPerSecond;
+      delete metricReport.availableSendBandwidth;
+      this.metricReport = {
+        metricBody: metricReport,
+      };
+      //console.log(this.metricReport);
+    } else {
+      this.log(`{'...empty...'}`);
+    }
   }
 
   async join(): Promise<void> {
@@ -738,6 +497,7 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     await this.openAudioInputFromSelection();
     await this.openAudioOutputFromSelection();
     this.audioVideo.start();
+    await this.audioVideo.chooseAudioInputDevice(this.audioInputSelectionToDevice('440 Hz'));
   }
 
   leave(): void {
@@ -812,16 +572,11 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     const handler = (attendeeId: string, present: boolean, externalUserId: string, dropped: boolean): void => {
       this.log(`${attendeeId} present = ${present} (${externalUserId})`);
       const isContentAttendee = new DefaultModality(attendeeId).hasModality(DefaultModality.MODALITY_CONTENT);
-      const isSelfAttendee = new DefaultModality(attendeeId).base() === this.meetingSession.configuration.credentials.attendeeId;
       if (!present) {
         delete this.roster[attendeeId];
         this.updateRoster();
         this.log(`${attendeeId} dropped = ${dropped} (${externalUserId})`);
         return;
-      }
-      //If someone else share content, stop the current content share
-      if (!this.allowMaxContentShare() && !isSelfAttendee && isContentAttendee && this.isButtonOn('button-content-share')) {
-        this.contentShareStop();
       }
       if (!this.roster[attendeeId]) {
         this.roster[attendeeId] = {
@@ -863,12 +618,11 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
           break; // only show the most active speaker
         }
       }
-      this.layoutFeaturedTile();
     };
     this.audioVideo.subscribeToActiveSpeakerDetector(
       new DefaultActiveSpeakerPolicy(),
       activeSpeakerHandler,
-      (scores: {[attendeeId:string]: number}) => {
+      (scores: { [attendeeId: string]: number }) => {
         for (const attendeeId in scores) {
           if (this.roster[attendeeId]) {
             this.roster[attendeeId].score = scores[attendeeId];
@@ -885,7 +639,7 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     const videoElement = document.getElementById(id) as HTMLVideoElement;
     const stream = videoElement.srcObject as MediaStream;
     const track = stream.getVideoTracks()[0];
-    let basicReports: {[id: string]: number} =  {};
+    let basicReports: { [id: string]: number } = {};
 
     let reports = await this.audioVideo.getRTCPeerConnectionStats(track);
     let duration: number;
@@ -909,53 +663,14 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
             duration = report.timestamp - duration;
             duration = duration / 1000;
             // remained to be calculated
-            basicReports['bitrate'] =  Math.trunc((report.bytesSent - basicReports['bitrate']) * 8 / duration);
+            basicReports['bitrate'] = Math.trunc((report.bytesSent - basicReports['bitrate']) * 8 / duration);
             basicReports['width'] = report.frameWidth;
             basicReports['height'] = report.frameHeight;
             basicReports['fps'] = Math.trunc((report.framesEncoded - basicReports['fps']) / duration);
-            this.log(JSON.stringify(basicReports));
+            //this.log(JSON.stringify(basicReports));
           }
         });
       });
-    });
-  }
-
-  dataMessageHandler(dataMessage: DataMessage): void {
-    if (!dataMessage.throttled) {
-      const isSelf = dataMessage.senderAttendeeId === this.meetingSession.configuration.credentials.attendeeId;
-      if (dataMessage.timestampMs <= this.lastReceivedMessageTimestamp) {
-        return;
-      }
-      this.lastReceivedMessageTimestamp = dataMessage.timestampMs;
-      const messageDiv = document.getElementById('receive-message') as HTMLDivElement;
-      const messageNameSpan = document.createElement('div') as HTMLDivElement;
-      messageNameSpan.classList.add('message-bubble-sender');
-      messageNameSpan.innerText = (dataMessage.senderExternalUserId.split('#').slice(-1)[0]);
-      const messageTextSpan = document.createElement('div') as HTMLDivElement;
-      messageTextSpan.classList.add(isSelf ? 'message-bubble-self' : 'message-bubble-other');
-      messageTextSpan.innerHTML = this.markdown.render(dataMessage.text()).replace(/[<]a /g, '<a target="_blank" ');
-      const appendClass = (element: HTMLElement, className: string) => {
-        for (let i = 0; i < element.children.length; i++) {
-          const child = element.children[i] as HTMLElement;
-          child.classList.add(className);
-          appendClass(child, className);
-        }
-      }
-      appendClass(messageTextSpan, 'markdown');
-      if (this.lastMessageSender !== dataMessage.senderAttendeeId) {
-        messageDiv.appendChild(messageNameSpan);
-      }
-      this.lastMessageSender = dataMessage.senderAttendeeId;
-      messageDiv.appendChild(messageTextSpan);
-      messageDiv.scrollTop = messageDiv.scrollHeight;
-    } else {
-      this.log('Message is throttled. Please resend');
-    }
-  }
-
-  setupDataMessage(): void {
-    this.audioVideo.realtimeSubscribeToReceiveDataMessage(DemoMeetingApp.DATA_MESSAGE_TOPIC, (dataMessage: DataMessage) => {
-      this.dataMessageHandler(dataMessage);
     });
   }
 
@@ -974,11 +689,30 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     return json;
   }
 
+  async getMeetingAttendeeInfo(): Promise<any> {
+
+    const meetingInfo = new URL(window.location.href).searchParams.get('meetingInfo');
+
+    const attendeeInfo = new URL(window.location.href).searchParams.get('attendeeInfo');
+
+    console.log(meetingInfo)
+    console.log(attendeeInfo)
+    return {
+      JoinInfo:
+        {
+          Meeting: JSON.parse(meetingInfo),
+          Attendee: JSON.parse(attendeeInfo),
+        },
+    }
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async endMeeting(): Promise<any> {
     await fetch(`${DemoMeetingApp.BASE_URL}end?title=${encodeURIComponent(this.meeting)}`, {
       method: 'POST',
     });
+    this.sendStatus('MeetingDelete', 1);
+
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -989,34 +723,6 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
       throw new Error(`Server error: ${json.error}`);
     }
     return json;
-  }
-
-  setupDeviceLabelTrigger(): void {
-    // Note that device labels are privileged since they add to the
-    // fingerprinting surface area of the browser session. In Chrome private
-    // tabs and in all Firefox tabs, the labels can only be read once a
-    // MediaStream is active. How to deal with this restriction depends on the
-    // desired UX. The device controller includes an injectable device label
-    // trigger which allows you to perform custom behavior in case there are no
-    // labels, such as creating a temporary audio/video stream to unlock the
-    // device names, which is the default behavior. Here we override the
-    // trigger to also show an alert to let the user know that we are asking for
-    // mic/camera permission.
-    //
-    // Also note that Firefox has its own device picker, which may be useful
-    // for the first device selection. Subsequent device selections could use
-    // a custom UX with a specific device id.
-    this.audioVideo.setDeviceLabelTrigger(
-      async (): Promise<MediaStream> => {
-        if (this.isRecorder() || this.isBroadcaster()) {
-          throw new Error('Recorder or Broadcaster does not need device labels');
-        }
-        this.switchToFlow('flow-need-permission');
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-        this.switchToFlow('flow-devices');
-        return stream;
-      }
-    );
   }
 
   populateDeviceList(
@@ -1054,138 +760,20 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     }
   }
 
-  populateInMeetingDeviceList(
-    elementId: string,
-    genericName: string,
-    devices: MediaDeviceInfo[],
-    additionalOptions: string[],
-    callback: (name: string) => void
-  ): void {
-    const menu = document.getElementById(elementId) as HTMLDivElement;
-    while (menu.firstElementChild) {
-      menu.removeChild(menu.firstElementChild);
-    }
-    for (let i = 0; i < devices.length; i++) {
-      this.createDropdownMenuItem(menu, devices[i].label || `${genericName} ${i + 1}`, () => {
-        callback(devices[i].deviceId);
-      });
-    }
-    if (additionalOptions.length > 0) {
-      this.createDropdownMenuItem(menu, '──────────', () => {}).classList.add('text-center');
-      for (const additionalOption of additionalOptions) {
-        this.createDropdownMenuItem(
-          menu,
-          additionalOption,
-          () => {
-            callback(additionalOption);
-          },
-          `${elementId}-${additionalOption.replace(/\s/g, '-')}`
-        );
-      }
-    }
-    if (!menu.firstElementChild) {
-      this.createDropdownMenuItem(menu, 'Device selection unavailable', () => {});
-    }
-  }
-
-  createDropdownMenuItem(
-    menu: HTMLDivElement,
-    title: string,
-    clickHandler: () => void,
-    id?: string
-  ): HTMLButtonElement {
-    const button = document.createElement('button') as HTMLButtonElement;
-    menu.appendChild(button);
-    button.innerText = title;
-    button.classList.add('dropdown-item');
-    this.updateProperty(button, 'id', id);
-    button.addEventListener('click', () => {
-      clickHandler();
-    });
-    return button;
-  }
-
   async populateAllDeviceLists(): Promise<void> {
-    await this.populateAudioInputList();
-    await this.populateVideoInputList();
-    await this.populateAudioOutputList();
   }
 
   async populateAudioInputList(): Promise<void> {
-    const genericName = 'Microphone';
-    const additionalDevices = ['None', '440 Hz'];
-    this.populateDeviceList(
-      'audio-input',
-      genericName,
-      await this.audioVideo.listAudioInputDevices(),
-      additionalDevices
-    );
-    this.populateInMeetingDeviceList(
-      'dropdown-menu-microphone',
-      genericName,
-      await this.audioVideo.listAudioInputDevices(),
-      additionalDevices,
-      async (name: string) => {
-        const device = await this.audioInputSelectionToDevice(name);
-        await this.audioVideo.chooseAudioInputDevice(device);
-      }
-    );
   }
 
-  async populateVideoInputList(): Promise<void> {
-    const genericName = 'Camera';
-    const additionalDevices = ['None', 'Blue', 'SMPTE Color Bars'];
-    this.populateDeviceList(
-      'video-input',
-      genericName,
-      await this.audioVideo.listVideoInputDevices(),
-      additionalDevices
-    );
-    this.populateInMeetingDeviceList(
-      'dropdown-menu-camera',
-      genericName,
-      await this.audioVideo.listVideoInputDevices(),
-      additionalDevices,
-      async (name: string) => {
-        try {
-          await this.openVideoInputFromSelection(name, false);
-        } catch (err) {
-          this.log('no video input device selected');
-        }
-      }
-    );
-    const cameras = await this.audioVideo.listVideoInputDevices();
-    this.cameraDeviceIds = cameras.map((deviceInfo) => {
-      return deviceInfo.deviceId;
-    });
-  }
-
-  async populateAudioOutputList(): Promise<void> {
-    const genericName = 'Speaker';
-    const additionalDevices: string[] = [];
-    this.populateDeviceList(
-      'audio-output',
-      genericName,
-      await this.audioVideo.listAudioOutputDevices(),
-      additionalDevices
-    );
-    this.populateInMeetingDeviceList(
-      'dropdown-menu-speaker',
-      genericName,
-      await this.audioVideo.listAudioOutputDevices(),
-      additionalDevices,
-      async (name: string) => {
-        await this.audioVideo.chooseAudioOutputDevice(name);
-      }
-    );
-  }
-
-  private analyserNodeCallback = () => {};
+  private analyserNodeCallback = () => {
+  };
 
   async openAudioInputFromSelection(): Promise<void> {
     const audioInput = document.getElementById('audio-input') as HTMLSelectElement;
-    const device = await this.audioInputSelectionToDevice(audioInput.value);
-    await this.audioVideo.chooseAudioInputDevice(device);
+    await this.audioVideo.chooseAudioInputDevice(
+      this.audioInputSelectionToDevice(audioInput.value)
+    );
     this.startAudioPreview();
   }
 
@@ -1197,6 +785,7 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
       audioPreview.setAttribute('aria-valuenow', `${percent}`);
     }
   }
+
 
   startAudioPreview(): void {
     this.setAudioPreviewPercent(0);
@@ -1235,130 +824,16 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
     await this.audioVideo.bindAudioElement(audioMix);
   }
 
-  private selectedVideoInput: string | null = null;
-
-  async openVideoInputFromSelection(selection: string | null, showPreview: boolean): Promise<void> {
-    if (selection) {
-      this.selectedVideoInput = selection;
-    }
-    this.log(`Switching to: ${this.selectedVideoInput}`);
-    const device = this.videoInputSelectionToDevice(this.selectedVideoInput);
-    if (device === null) {
-      if (showPreview) {
-        this.audioVideo.stopVideoPreviewForVideoInput(document.getElementById(
-          'video-preview'
-        ) as HTMLVideoElement);
-      }
-      this.audioVideo.stopLocalVideoTile();
-      this.toggleButton('button-camera', 'off');
-      // choose video input null is redundant since we expect stopLocalVideoTile to clean up
-      await this.audioVideo.chooseVideoInputDevice(device);
-      throw new Error('no video device selected');
-    }
-    await this.audioVideo.chooseVideoInputDevice(device);
-    if (showPreview) {
-      this.audioVideo.startVideoPreviewForVideoInput(document.getElementById(
-        'video-preview'
-      ) as HTMLVideoElement);
-    }
-  }
-
-  private async audioInputSelectionToDevice(value: string): Promise<Device> {
+  private audioInputSelectionToDevice(value: string): Device {
     if (this.isRecorder() || this.isBroadcaster()) {
       return null;
     }
     if (value === '440 Hz') {
       return DefaultDeviceController.synthesizeAudioDevice(440);
-    }
-    if (value === 'None') {
-      return null;
-    }
-    return value;
-  }
-
-  private videoInputSelectionToDevice(value: string): Device {
-    if (this.isRecorder() || this.isBroadcaster()) {
-      return null;
-    }
-    if (value === 'Blue') {
-      return DefaultDeviceController.synthesizeVideoDevice('blue');
-    } else if (value === 'SMPTE Color Bars') {
-      return DefaultDeviceController.synthesizeVideoDevice('smpte');
     } else if (value === 'None') {
       return null;
     }
     return value;
-  }
-
-  private initContentShareDropDownItems(): void {
-    let item = document.getElementById('dropdown-item-content-share-screen-capture');
-    item.addEventListener('click', () => {
-      this.contentShareTypeChanged(ContentShareType.ScreenCapture);
-    });
-
-    item = document.getElementById('dropdown-item-content-share-screen-test-video');
-    item.addEventListener('click', () => {
-      this.contentShareTypeChanged(ContentShareType.VideoFile, DemoMeetingApp.testVideo);
-    });
-
-    document.getElementById('content-share-item').addEventListener('change', () => {
-      const fileList = document.getElementById('content-share-item') as HTMLInputElement;
-      const file = fileList.files[0];
-      if (!file) {
-        this.log('no content share selected');
-        return;
-      }
-      const url = URL.createObjectURL(file);
-      this.log(`content share selected: ${url}`);
-      this.contentShareTypeChanged(ContentShareType.VideoFile, url);
-      fileList.value = '';
-    });
-  }
-
-  private async contentShareTypeChanged(contentShareType: ContentShareType, videoUrl?: string): Promise<void> {
-    if (this.isButtonOn('button-content-share')) {
-      await this.contentShareStop();
-    }
-    this.contentShareType = contentShareType;
-    await this.contentShareStart(videoUrl);
-  }
-
-  private async contentShareStart(videoUrl?: string): Promise<void> {
-    this.toggleButton('button-content-share');
-    switch (this.contentShareType) {
-      case ContentShareType.ScreenCapture:
-        this.audioVideo.startContentShareFromScreenCapture();
-        break;
-      case ContentShareType.VideoFile:
-        const videoFile = document.getElementById('content-share-video') as HTMLVideoElement;
-        if (videoUrl) {
-          videoFile.src = videoUrl;
-        }
-        await videoFile.play();
-        let mediaStream: MediaStream;
-        if(this.defaultBrowserBehaviour.hasFirefoxWebRTC()) {
-          // @ts-ignore
-          mediaStream = videoFile.mozCaptureStream();
-        } else {
-          // @ts-ignore
-          mediaStream = videoFile.captureStream();
-        }
-        this.audioVideo.startContentShare(mediaStream);
-        break;
-    }
-  }
-
-  private async contentShareStop(): Promise<void> {
-    if (this.isButtonOn('button-pause-content-share')) {
-      this.toggleButton('button-pause-content-share');
-    }
-    this.toggleButton('button-content-share');
-    this.audioVideo.stopContentShare();
-    if (this.contentShareType === ContentShareType.VideoFile) {
-      const videoFile = document.getElementById('content-share-video') as HTMLVideoElement;
-      videoFile.pause();
-      videoFile.style.display = 'none';
-    }
   }
 
   isRecorder(): boolean {
@@ -1370,8 +845,9 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
   }
 
   async authenticate(): Promise<string> {
-    let joinInfo = (await this.joinMeeting()).JoinInfo;
-    const configuration = new MeetingSessionConfiguration(joinInfo.Meeting, joinInfo.Attendee);
+    let joinInfo2 = (await this.getMeetingAttendeeInfo()).JoinInfo;
+    console.log('joinInfo 22222 &&&&& ', joinInfo2)
+    const configuration = new MeetingSessionConfiguration(joinInfo2.Meeting, joinInfo2.Attendee);
     await this.initializeMeetingSession(configuration);
     const url = new URL(window.location.href);
     url.searchParams.set('m', this.meeting);
@@ -1380,228 +856,51 @@ export class DemoMeetingApp implements AudioVideoObserver, DeviceChangeObserver,
   }
 
   log(str: string): void {
+    if (this.logger !== null) {
+      this.logger.info(str);
+    }
     console.log(`[DEMO] ${str}`);
   }
 
   audioVideoDidStartConnecting(reconnecting: boolean): void {
-    this.log(`session connecting. reconnecting: ${reconnecting}`);
+    if (reconnecting === true) {
+      this.log('ReconnectingSession');
+      this.sendStatus('ReconnectingSession', 1);
+    } else {
+      this.log('ConnectingSession');
+      this.sendStatus('ConnectingSession', 1);
+    }
   }
 
   audioVideoDidStart(): void {
-    this.log('session started');
+    this.log('MeetingStarted');
+    this.meetingActive = true;
+    this.sendStatus('MeetingStarted', 1);
   }
 
   audioVideoDidStop(sessionStatus: MeetingSessionStatus): void {
-    this.log(`session stopped from ${JSON.stringify(sessionStatus)}`);
+    this.log(`SessionStopped from ${JSON.stringify(sessionStatus)}`);
+    const statusCode = sessionStatus.statusCode();
+    this.meetingActive = false;
+    this.sendStatus('StatusCode-' + statusCode, 1);
+    this.log('StatusCode: ' + statusCode + 'instanceId: ' + this.instanceId);
     if (sessionStatus.statusCode() === MeetingSessionStatusCode.AudioCallEnded) {
       this.log(`meeting ended`);
-      // @ts-ignore
-      window.location = window.location.pathname;
     }
-  }
-
-  videoTileDidUpdate(tileState: VideoTileState): void {
-    this.log(`video tile updated: ${JSON.stringify(tileState, null, '  ')}`);
-    if (!tileState.boundAttendeeId) {
-      return;
-    }
-    const tileIndex = tileState.localTile
-      ? 16
-      : this.tileOrganizer.acquireTileIndex(tileState.tileId);
-    const tileElement = document.getElementById(`tile-${tileIndex}`) as HTMLDivElement;
-    const videoElement = document.getElementById(`video-${tileIndex}`) as HTMLVideoElement;
-    const nameplateElement = document.getElementById(`nameplate-${tileIndex}`) as HTMLDivElement;
-    const pauseButtonElement = document.getElementById(`video-pause-${tileIndex}`) as HTMLButtonElement;
-
-    pauseButtonElement.addEventListener('click', () => {
-      if (!tileState.paused) {
-        this.audioVideo.pauseVideoTile(tileState.tileId);
-        pauseButtonElement.innerText = 'Resume';
-      } else {
-        this.audioVideo.unpauseVideoTile(tileState.tileId);
-        pauseButtonElement.innerText = 'Pause';
-      }
-    });
-
-    this.log(`binding video tile ${tileState.tileId} to ${videoElement.id}`);
-    this.audioVideo.bindVideoElement(tileState.tileId, videoElement);
-    this.tileIndexToTileId[tileIndex] = tileState.tileId;
-    this.tileIdToTileIndex[tileState.tileId] = tileIndex;
-    this.updateProperty(nameplateElement, 'innerText', tileState.boundExternalUserId.split('#')[1]);
-
-    this.showTile(tileElement, tileState);
-    this.updateGridClasses();
-    this.layoutFeaturedTile();
-  }
-
-  videoTileWasRemoved(tileId: number): void {
-    const tileIndex = this.tileOrganizer.releaseTileIndex(tileId);
-    this.log(`video tileId removed: ${tileId} from tile-${tileIndex}`);
-    this.hideTile(tileIndex);
-    this.updateGridClasses();
-  }
-
-  videoAvailabilityDidChange(availability: MeetingSessionVideoAvailability): void {
-    this.canStartLocalVideo = availability.canStartLocalVideo;
-    this.log(`video availability changed: canStartLocalVideo  ${availability.canStartLocalVideo}`);
-  }
-
-  showTile(tileElement: HTMLDivElement, tileState: VideoTileState) {
-    tileElement.classList.add(`active`);
-
-    if (tileState.isContent) {
-      tileElement.classList.add('content');
-    }
-  }
-
-  hideTile(tileIndex: number): void {
-    const tileElement = document.getElementById(`tile-${tileIndex}`) as HTMLDivElement;
-    tileElement.classList.remove('active', 'featured', 'content');
-  }
-
-  tileIdForAttendeeId(attendeeId: string): number | null {
-    for (const tile of this.audioVideo.getAllVideoTiles()) {
-      const state = tile.state();
-      if (state.boundAttendeeId === attendeeId) {
-        return state.tileId;
-      }
-    }
-    return null;
-  }
-
-  findContentTileId(): number | null {
-    for (const tile of this.audioVideo.getAllVideoTiles()) {
-      const state = tile.state();
-      if (state.isContent) {
-        return state.tileId;
-      }
-    }
-    return null;
-  }
-
-  activeTileId(): number | null {
-    let contentTileId = this.findContentTileId();
-    if (contentTileId !== null) {
-      return contentTileId;
-    }
-    for (const attendeeId in this.roster) {
-      if (this.roster[attendeeId].active) {
-        return this.tileIdForAttendeeId(attendeeId);
-      }
-    }
-    return null;
-  }
-
-  layoutFeaturedTile(): void {
-    if (!this.meetingSession) {
-      return;
-    }
-    const tilesIndices = this.visibleTileIndices();
-    const localTileId = this.localTileId();
-    const activeTile = this.activeTileId();
-
-    for (let i = 0; i < tilesIndices.length; i++) {
-      const tileIndex = tilesIndices[i];
-      const tileElement = document.getElementById(`tile-${tileIndex}`) as HTMLDivElement;
-      const tileId = this.tileIndexToTileId[tileIndex];
-
-      if (tileId === activeTile && tileId !== localTileId) {
-        tileElement.classList.add('featured');
-      } else {
-        tileElement.classList.remove('featured');
-      }
-    }
-
-    this.updateGridClasses();
-  }
-
-  updateGridClasses() {
-    const localTileId = this.localTileId();
-    const activeTile = this.activeTileId();
-
-    this.tileArea.className = `v-grid size-${this.availablelTileSize()}`;
-
-    if (activeTile && activeTile !== localTileId) {
-      this.tileArea.classList.add('featured')
-    } else {
-      this.tileArea.classList.remove('featured');
-    }
-  }
-
-  availablelTileSize(): number {
-    return this.tileOrganizer.remoteTileCount +
-    (this.audioVideo.hasStartedLocalVideoTile() ? 1 : 0);
-  }
-
-  localTileId(): number | null {
-    return this.audioVideo.hasStartedLocalVideoTile() ? this.audioVideo.getLocalVideoTile().state().tileId : null;
-  }
-
-  visibleTileIndices(): number[] {
-    const tileKeys = Object.keys(this.tileOrganizer.tiles);
-    const tiles = tileKeys.map(tileId => parseInt(tileId));
-    return tiles;
-  }
-
-  setUpVideoTileElementResizer(): void {
-    for (let i = 0; i <= DemoTileOrganizer.MAX_TILES; i++) {
-      const videoElem = document.getElementById(`video-${i}`) as HTMLVideoElement;
-      videoElem.onresize = () => {
-        if (videoElem.videoHeight > videoElem.videoWidth) {
-          // portrait mode
-          videoElem.style.objectFit = 'contain';
-          this.log(`video-${i} changed to portrait mode resolution ${videoElem.videoWidth}x${videoElem.videoHeight}`);
-        } else {
-          videoElem.style.objectFit = 'cover';
-        }
-      };
-    }
-  }
-
-  allowMaxContentShare(): boolean {
-    const allowed = (new URL(window.location.href).searchParams.get('max-content-share')) === 'true';
-    if (allowed) {
-      return true;
-    }
-    return false;
   }
 
   connectionDidBecomePoor(): void {
     this.log('connection is poor');
   }
 
-  connectionDidSuggestStopVideo(): void {
-    this.log('suggest turning the video off');
-  }
 
   connectionDidBecomeGood(): void {
     this.log('connection is good now');
   }
 
-  videoSendDidBecomeUnavailable(): void {
-    this.log('sending video is not available');
+  didReceivePong() {
   }
 
-  contentShareDidStart(): void {
-    this.log('content share started.');
-  }
-
-  contentShareDidStop(): void {
-    this.log('content share stopped.');
-    if (this.isButtonOn('button-content-share')) {
-      this.buttonStates['button-content-share'] = false;
-      this.buttonStates['button-pause-content-share'] = false;
-      this.displayButtonStates();
-    }
-  }
-
-  contentShareDidPause(): void {
-    this.log('content share paused.');
-  }
-
-  contentShareDidUnpause(): void {
-    this.log(`content share unpaused.`);
-  }
 }
 
 window.addEventListener('load', () => {
