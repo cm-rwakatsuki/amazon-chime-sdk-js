@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+<<<<<<< HEAD
 - Update the clicking sound answer in FAQs
+=======
+- Fix Github Actions CI workflow to include all integ tests
+>>>>>>> Modify Github Actions Jobs
 
 ## [1.22.0] - 2020-11-10
 ### Added
