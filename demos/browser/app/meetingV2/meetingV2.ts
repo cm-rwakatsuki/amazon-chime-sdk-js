@@ -40,6 +40,10 @@ import {
 } from '../../../../src/index';
 import WebRTCStatsCollector from './webrtcstatscollector/WebRTCStatsCollector';
 
+import * as bodyPix from '@tensorflow-models/body-pix';
+import * as tf from '@tensorflow/tfjs';
+console.log('Using TensorFlow backend: ', tf.getBackend());
+
 class DemoTileOrganizer {
   // this is index instead of length
   static MAX_TILES = 17;
@@ -413,6 +417,7 @@ export class DemoMeetingApp implements
 
     const buttonVideo = document.getElementById('button-camera');
     buttonVideo.addEventListener('click', _e => {
+      this.removeIntermediateElement();
       new AsyncScheduler().start(async () => {
         if (this.toggleButton('button-camera') && this.canStartLocalVideo) {
           try {
@@ -1239,7 +1244,7 @@ export class DemoMeetingApp implements
 
   async populateVideoInputList(): Promise<void> {
     const genericName = 'Camera';
-    const additionalDevices = ['None', 'Blue', 'SMPTE Color Bars'];
+    const additionalDevices = ['None', 'Blue', 'SMPTE Color Bars', 'Bokeh BackGround'];
     this.populateDeviceList(
       'video-input',
       genericName,
@@ -1343,6 +1348,7 @@ export class DemoMeetingApp implements
   private selectedVideoInput: string | null = null;
 
   async openVideoInputFromSelection(selection: string | null, showPreview: boolean): Promise<void> {
+    this.removeIntermediateElement();
     if (selection) {
       this.selectedVideoInput = selection;
     }
@@ -1365,6 +1371,19 @@ export class DemoMeetingApp implements
       this.audioVideo.startVideoPreviewForVideoInput(document.getElementById(
         'video-preview'
       ) as HTMLVideoElement);
+    }
+  }
+
+  removeIntermediateElement(): void {
+    const blurredCanvasElement = document.getElementById('blurredCanvasElement');
+    if (blurredCanvasElement) {
+      blurredCanvasElement.remove();
+      console.log('blurredCanvasElement removed');
+    }
+    const inputVideoElement = document.getElementById('inputVideoElement');
+    if (inputVideoElement) {
+      inputVideoElement.remove();
+      console.log('inputVideoElement removed');
     }
   }
 
@@ -1391,6 +1410,12 @@ export class DemoMeetingApp implements
       return DefaultDeviceController.synthesizeVideoDevice('smpte');
     } else if (value === 'None') {
       return null;
+    } else if (value === 'Bokeh BackGround') {
+      this.startDrawBokehEffect();
+      interface CanvasElement extends HTMLCanvasElement {
+        captureStream(frameRate?: number): MediaStream;
+      }
+      return (<CanvasElement>document.getElementById('blurredCanvasElement')).captureStream();
     }
     return value;
   }
@@ -1722,6 +1747,66 @@ export class DemoMeetingApp implements
 
   remoteVideoSourcesDidChange(videoSources: VideoSource[]) {
     this.log(`available remote video sources changed: ${JSON.stringify(videoSources)}`);
+  }
+
+  async setupCamera(videoElement: any) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: 1280,
+        height: 720,
+      },
+      audio: false,
+    });
+    videoElement.srcObject = stream;
+    return new Promise(resolve => {
+      videoElement.onloadedmetadata = () => {
+        videoElement.play();
+        resolve();
+      };
+    });
+  }
+
+  segmentBody(input: HTMLVideoElement, output: HTMLCanvasElement, bodypixnet: bodyPix.BodyPix) {
+    async function renderFrame() {
+      const segmentation = await bodypixnet.segmentPerson(input);
+      const backgroundBlurAmount = 7;
+      const edgeBlurAmount = 3;
+      const flipHorizontal = false;
+      bodyPix.drawBokehEffect(
+        output,
+        input,
+        segmentation,
+        backgroundBlurAmount,
+        edgeBlurAmount,
+        flipHorizontal
+      );
+      if (document.getElementById('blurredCanvasElement')) {
+        requestAnimationFrame(renderFrame);
+      }
+    }
+    renderFrame();
+  }
+
+  async startDrawBokehEffect() {
+    const input = document.createElement('video') as HTMLVideoElement;
+    input.width = 1280;
+    input.height = 720;
+    input.muted = true;
+    input.autoplay = true;
+    input.setAttribute('id', 'inputVideoElement');
+    if (input.srcObject) {
+      input.srcObject = null;
+    } else {
+      const output = document.createElement('canvas') as HTMLCanvasElement;
+      output.width = 1280;
+      output.height = 720;
+      output.setAttribute('id', 'blurredCanvasElement');
+      output.setAttribute('style', 'display:none');
+      document.body.appendChild(output);
+      await this.setupCamera(input);
+      const bodypixnet: bodyPix.BodyPix = await bodyPix.load();
+      this.segmentBody(input, output, bodypixnet);
+    }
   }
 }
 

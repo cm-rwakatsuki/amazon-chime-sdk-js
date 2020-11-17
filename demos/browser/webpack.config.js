@@ -67,6 +67,11 @@ module.exports = env => {
           test: /\.tsx?$/,
           loader: 'ts-loader',
         },
+        {
+          test: /\.js$/,
+          enforce: 'pre',
+          use: ['source-map-loader'],
+        },
       ],
     },
     mode: 'development',
